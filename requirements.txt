@@ -1,0 +1,25 @@
+# NSE Stockbee Scanner — Dependencies
+# Based on Pradeep Bonde (Stockbee) methodology
+
+# Core data
+yfinance>=0.2.40
+pandas>=2.1.0
+numpy>=1.26.0
+pyarrow>=14.0.0          # Parquet backend for price cache
+scipy>=1.11.0            # regression for linearity score (optional)
+
+# Reporting
+openpyxl>=3.1.2          # Excel workbook generation
+requests>=2.31.0         # NSE universe fetch + Telegram
+
+# Timezone handling (for IST automation)
+pytz>=2024.1
+
+# Optional: fundamental data for Real EP / MAGNA53
+# yfinance provides quarterly_financials for free
+# For NSE-specific data, you may also use:
+# nsepython>=2.0          # NSE Python library (unofficial)
+# jugaad-data>=0.27       # NSE/BSE financial data
+
+# Development / testing
+pytest>=7.4.0
