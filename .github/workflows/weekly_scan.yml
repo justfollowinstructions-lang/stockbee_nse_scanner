@@ -1,0 +1,175 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bonde NSE Scanner — Weekly Breadth Scan
+# GitHub Actions Workflow
+#
+# Runs every Saturday at 8:00 AM IST (2:30 AM UTC).
+# Captures the full week's breadth data after Friday close.
+#
+# What it does:
+#   1. Full price data refresh (splits/dividends adjusted by yfinance Sat/Sun)
+#   2. Weekly breadth scan: TI65, RS ranks, market regime classification
+#   3. Persists breadth snapshot to SQLite
+#   4. Sends Telegram weekly market health summary
+#   5. Uploads DB + Excel report + logs as artifacts (60-day retention)
+#
+# Secrets required:
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Bonde Weekly Breadth
+
+on:
+  schedule:
+    # Saturday 08:00 IST = Friday 02:30 UTC
+    - cron: "30 2 * * 6"
+
+  workflow_dispatch:
+    inputs:
+      notify_telegram:
+        description: "Send Telegram notification? (yes / no)"
+        required: false
+        default: "yes"
+
+env:
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+  ACCOUNT_SIZE:       ${{ secrets.ACCOUNT_SIZE || '1000000' }}
+  RISK_PCT:           ${{ secrets.RISK_PCT || '1.0' }}
+
+concurrency:
+  group: bonde-scanner
+  cancel-in-progress: false
+
+jobs:
+  weekly-breadth:
+    name: Bonde Weekly Breadth Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ─────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. Date metadata ─────────────────────────────────────────────────────
+      - name: Get date metadata
+        id: date
+        run: |
+          echo "today=$(date +'%Y-%m-%d')"                          >> $GITHUB_OUTPUT
+          echo "week=$(date +'%Y-W%V')"                             >> $GITHUB_OUTPUT
+          echo "ist=$(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M IST')" >> $GITHUB_OUTPUT
+
+      # ── 4. Restore price DB cache ────────────────────────────────────────────
+      # Weekend run always forces a full refresh (split/dividend adjustments).
+      # We restore the old cache first so only adjusted symbols re-download.
+      - name: Restore price data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/
+            scanner.db
+          key: bonde-price-db-${{ runner.os }}-${{ steps.date.outputs.week }}
+          restore-keys: |
+            bonde-price-db-${{ runner.os }}-week-
+            bonde-price-db-${{ runner.os }}-
+
+      # ── 5. Full price refresh ────────────────────────────────────────────────
+      # Always full-refresh on weekends — yfinance adjusts for corporate
+      # actions retroactively; stale weekday cache may have bad prices.
+      - name: Full price refresh
+        run: |
+          echo "Running full price refresh for weekend adjustment …"
+          python main.py --full-refresh
+
+      # ── 6. Run weekly breadth scan ───────────────────────────────────────────
+      - name: Run weekly scan
+        run: python main.py --weekly
+
+      # ── 7. Upload artifacts ───────────────────────────────────────────────────
+      - name: Upload signals database
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonde-weekly-db-${{ steps.date.outputs.week }}
+          path: scanner.db
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: Upload weekly Excel report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonde-weekly-report-${{ steps.date.outputs.week }}
+          path: "*.xlsx"
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonde-weekly-logs-${{ steps.date.outputs.week }}
+          path: logs/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── 8. Job summary ────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          python - << 'PYEOF'
+          import sqlite3, os
+          from pathlib import Path
+
+          db  = Path("scanner.db")
+          out = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          ist = os.environ.get("IST_TIME", "")
+
+          lines = [f"## Bonde Weekly Breadth — {ist}", ""]
+
+          if db.exists():
+              try:
+                  con = sqlite3.connect(db)
+                  # Pull latest market monitor snapshot
+                  row = con.execute(
+                      "SELECT * FROM market_monitor ORDER BY snap_date DESC LIMIT 1"
+                  ).fetchone()
+                  if row:
+                      cols = [d[0] for d in con.execute(
+                          "SELECT * FROM market_monitor LIMIT 0").description]
+                      r = dict(zip(cols, row))
+                      lines += [
+                          "| Metric | Value |",
+                          "|--------|-------|",
+                          f"| Snap date | {r.get('snap_date','?')} |",
+                          f"| TI65 (stocks above 65-day MA) | **{r.get('ti65','?')}%** |",
+                          f"| TI200 (stocks above 200-day MA) | {r.get('ti200','?')}% |",
+                          f"| Market regime | **{r.get('regime','?')}** |",
+                          f"| RS leader count | {r.get('rs_leaders','?')} |",
+                          f"| New 52w highs | {r.get('new_highs_52w','?')} |",
+                      ]
+                  con.close()
+              except Exception as e:
+                  lines.append(f"⚠️ Could not query DB: {e}")
+          else:
+              lines.append("⚠️ scanner.db not found — scan may have failed.")
+
+          lines += ["", "Download **bonde-weekly-report** artifact for the full Excel breadth report."]
+
+          with open(out, "a") as f:
+              f.write("\n".join(lines) + "\n")
+          PYEOF
+        env:
+          IST_TIME: ${{ steps.date.outputs.ist }}
