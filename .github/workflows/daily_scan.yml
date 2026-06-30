@@ -1,212 +1,224 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Bonde NSE Scanner — Daily EOD Production Run
-# GitHub Actions Workflow
-#
-# Runs every weekday at 3:45 PM IST (10:15 AM UTC) — 15 min before NSE close.
-# yfinance delivers final close prices after 3:30 PM IST; 3:45 PM is safe.
-#
-# What it does:
-#   1. Restores cached price DB (avoids full re-download every run)
-#   2. Incremental price update (only new bars since last run)
-#   3. Full Bonde scan: Market Monitor → RS Ranks → MB → EP → signals
-#   4. Persists signals to SQLite
-#   5. Sends Telegram alert with today's signals
-#   6. Uploads SQLite DB + Excel report + logs as artifacts (30-day retention)
-#   7. Saves updated price DB back to cache
-#
-# Secrets required (Settings → Secrets → Actions):
-#   TELEGRAM_BOT_TOKEN   — bot token from @BotFather
-#   TELEGRAM_CHAT_ID     — your chat / channel ID
-#
-# Optional secrets (have config.py defaults if not set):
-#   ACCOUNT_SIZE         — defaults to 1000000
-#   RISK_PCT             — defaults to 1.0
+# Bonde NSE Scanner — Daily EOD Production Workflow
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Bonde Daily Scan
 
 on:
   schedule:
-    #         ┌─ min  ┌─ hour (UTC)  ┌─ day  ┌─ month  ┌─ weekday (1=Mon)
-    - cron: "15 10 * * 1-5"   # 10:15 UTC = 15:45 IST, Mon–Fri
+    # 10:15 UTC = 3:45 PM IST
+    - cron: "15 10 * * 1-5"
 
-  workflow_dispatch:           # manual trigger from Actions tab
+  workflow_dispatch:
     inputs:
       full_refresh:
-        description: "Re-download full price history? (yes / no)"
+        description: "Re-download complete history"
         required: false
         default: "no"
+
       refresh_universe:
-        description: "Force re-fetch NSE symbol universe? (yes / no)"
+        description: "Refresh NSE symbol universe"
         required: false
         default: "no"
+
       notify_telegram:
-        description: "Send Telegram notification? (yes / no)"
+        description: "Send Telegram notification"
         required: false
         default: "yes"
 
 env:
   TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-  TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-  ACCOUNT_SIZE:       ${{ secrets.ACCOUNT_SIZE || '1000000' }}
-  RISK_PCT:           ${{ secrets.RISK_PCT || '1.0' }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+  ACCOUNT_SIZE: ${{ secrets.ACCOUNT_SIZE || '1000000' }}
+  RISK_PCT: ${{ secrets.RISK_PCT || '1.0' }}
 
 concurrency:
-  group: bonde-scanner          # only 1 scan runs at a time
-  cancel-in-progress: false     # never kill a scan mid-flight
+  group: bonde-scanner
+  cancel-in-progress: false
 
 jobs:
+
   daily-scan:
-    name: Bonde Daily Scan — NSE
+
     runs-on: ubuntu-latest
-    timeout-minutes: 60         # full NSE scan ~15-25 min; 60 is safe headroom
+
+    timeout-minutes: 60
 
     steps:
-      # ── 1. Checkout ─────────────────────────────────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      # ── 2. Python setup ─────────────────────────────────────────────────────
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: pip
+        cache-dependency-path: requirements.txt
 
-      # ── 3. Date metadata (used in artifact names + summary) ─────────────────
-      - name: Get date metadata
-        id: date
-        run: |
-          echo "today=$(date +'%Y-%m-%d')"                          >> $GITHUB_OUTPUT
-          echo "week=$(date +'%Y-W%V')"                             >> $GITHUB_OUTPUT
-          echo "ist=$(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M IST')" >> $GITHUB_OUTPUT
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
 
-      # ── 4. Restore price DB cache ────────────────────────────────────────────
-      # Cache key includes week number → forces fresh download every Monday.
-      # This ensures corporate action adjustments applied by yfinance over
-      # weekends are picked up before the week's first scan.
-      - name: Restore price data cache
-        id: cache-restore
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/
-            scanner.db
-          key: bonde-price-db-${{ runner.os }}-${{ steps.date.outputs.week }}
-          restore-keys: |
-            bonde-price-db-${{ runner.os }}-week-
-            bonde-price-db-${{ runner.os }}-
+    - name: Date metadata
+      id: meta
+      run: |
+        echo "today=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+        echo "week=$(date +'%Y-W%V')" >> $GITHUB_OUTPUT
+        echo "ist=$(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M IST')" >> $GITHUB_OUTPUT
 
-      # ── 5. Update price data ─────────────────────────────────────────────────
-      - name: Update price data
-        run: |
-          if [ "${{ github.event.inputs.full_refresh }}" = "yes" ]; then
-            echo "Full refresh requested — re-downloading all history"
-            python main.py --full-refresh
-          else
-            echo "Incremental update — fetching only new bars"
-            python main.py
-          fi
-        # We exit here immediately after download; the scan step below
-        # runs the full pipeline. If the scanner already combines both
-        # (as the default does), remove this step and keep only the next one.
+    - name: Restore cache
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          data/
+          scanner.db
+          logs/
+        key: bonde-cache-${{ runner.os }}-${{ steps.meta.outputs.week }}
+        restore-keys: |
+          bonde-cache-${{ runner.os }}-
 
-      # ── 6. Run Bonde scan ────────────────────────────────────────────────────
-      - name: Run Bonde scanner
-        run: |
-          EXTRA_ARGS=""
-          if [ "${{ github.event.inputs.refresh_universe }}" = "yes" ]; then
-            EXTRA_ARGS="$EXTRA_ARGS --refresh-universe"
-          fi
-          python main.py $EXTRA_ARGS
+    ##########################################################################
+    # ONLY ONE EXECUTION OF main.py
+    ##########################################################################
 
-      # ── 7. Upload SQLite signals database ────────────────────────────────────
-      - name: Upload signals database
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bonde-signals-db-${{ steps.date.outputs.today }}
-          path: scanner.db
-          retention-days: 30
-          if-no-files-found: warn
+    - name: Run Bonde Scanner
+      run: |
 
-      # ── 8. Upload Excel report ────────────────────────────────────────────────
-      - name: Upload Excel report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bonde-report-${{ steps.date.outputs.today }}
-          path: "*.xlsx"
-          retention-days: 30
-          if-no-files-found: warn
+        EXTRA_ARGS=""
 
-      # ── 9. Upload logs ────────────────────────────────────────────────────────
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bonde-logs-${{ steps.date.outputs.today }}
-          path: logs/
-          retention-days: 14
-          if-no-files-found: warn
+        if [ "${{ github.event.inputs.full_refresh }}" = "yes" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --full-refresh"
+        fi
 
-      # ── 10. GitHub Actions job summary ───────────────────────────────────────
-      - name: Write job summary
-        if: always()
-        run: |
-          python - << 'PYEOF'
-          import sqlite3, os
-          from pathlib import Path
+        if [ "${{ github.event.inputs.refresh_universe }}" = "yes" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --refresh-universe"
+        fi
 
-          db      = Path("scanner.db")
-          out     = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
-          ist     = os.environ.get("IST_TIME", "")
-          today   = os.environ.get("TODAY", "")
+        if [ "${{ github.event.inputs.notify_telegram }}" = "no" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --no-telegram"
+        fi
 
-          lines = [
-              f"## Bonde Daily Scan — {ist}",
-              "",
-          ]
+        echo "Running: python main.py $EXTRA_ARGS"
 
-          if db.exists():
-              try:
-                  con = sqlite3.connect(db)
-                  # Today's signals
-                  signals = con.execute(
-                      "SELECT COUNT(*) FROM signals WHERE scan_date = date('now')"
-                  ).fetchone()[0]
-                  mb = con.execute(
-                      "SELECT COUNT(*) FROM signals WHERE scan_date = date('now') AND signal_type LIKE 'MB%'"
-                  ).fetchone()[0]
-                  ep = con.execute(
-                      "SELECT COUNT(*) FROM signals WHERE scan_date = date('now') AND signal_type LIKE 'EP%'"
-                  ).fetchone()[0]
-                  con.close()
-                  lines += [
-                      "| Metric | Value |",
-                      "|--------|-------|",
-                      f"| Total signals today | **{signals}** |",
-                      f"| Momentum Burst (MB) | {mb} |",
-                      f"| Episodic Pivot (EP) | {ep} |",
-                  ]
-              except Exception as e:
-                  lines.append(f"⚠️ Could not query DB: {e}")
-          else:
-              lines.append("⚠️ scanner.db not found — scan may have failed.")
+        python main.py $EXTRA_ARGS
 
-          lines += [
-              "",
-              "Download **bonde-signals-db** artifact to query full signal history.",
-              "Download **bonde-report** artifact for the Excel report.",
-          ]
+    ##########################################################################
+    # Upload database
+    ##########################################################################
 
-          with open(out, "a") as f:
-              f.write("\n".join(lines) + "\n")
-          PYEOF
-        env:
-          IST_TIME: ${{ steps.date.outputs.ist }}
-          TODAY:    ${{ steps.date.outputs.today }}
+    - name: Upload SQLite database
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bonde-signals-db-${{ steps.meta.outputs.today }}
+        path: |
+          scanner.db
+          data/signals.db
+        retention-days: 30
+        if-no-files-found: warn
+
+    ##########################################################################
+    # Upload reports
+    ##########################################################################
+
+    - name: Upload Reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bonde-report-${{ steps.meta.outputs.today }}
+        path: |
+          reports/**/*.xlsx
+          *.xlsx
+        retention-days: 30
+        if-no-files-found: warn
+
+    ##########################################################################
+    # Upload logs
+    ##########################################################################
+
+    - name: Upload Logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bonde-logs-${{ steps.meta.outputs.today }}
+        path: logs/**
+        retention-days: 14
+        if-no-files-found: warn
+
+    ##########################################################################
+    # Summary
+    ##########################################################################
+
+    - name: Workflow Summary
+      if: always()
+      env:
+        IST_TIME: ${{ steps.meta.outputs.ist }}
+      run: |
+        python <<'PY'
+
+        import sqlite3
+        import os
+        from pathlib import Path
+
+        summary=os.environ["GITHUB_STEP_SUMMARY"]
+
+        db_candidates=[
+            Path("data/signals.db"),
+            Path("scanner.db")
+        ]
+
+        db=None
+        for p in db_candidates:
+            if p.exists():
+                db=p
+                break
+
+        text=[]
+
+        text.append(f"# Bonde Daily Scan")
+        text.append("")
+        text.append(f"**Completed:** {os.environ['IST_TIME']}")
+        text.append("")
+
+        if db:
+
+            try:
+
+                con=sqlite3.connect(db)
+
+                total=con.execute(
+                    "SELECT COUNT(*) FROM signals WHERE scan_date=date('now')"
+                ).fetchone()[0]
+
+                mb=con.execute(
+                    "SELECT COUNT(*) FROM signals WHERE scan_date=date('now') AND signal_type LIKE 'MB%'"
+                ).fetchone()[0]
+
+                ep=con.execute(
+                    "SELECT COUNT(*) FROM signals WHERE scan_date=date('now') AND signal_type LIKE 'EP%'"
+                ).fetchone()[0]
+
+                con.close()
+
+                text.extend([
+                    "|Metric|Value|",
+                    "|---|---:|",
+                    f"|Total Signals|{total}|",
+                    f"|Momentum Burst|{mb}|",
+                    f"|Episodic Pivot|{ep}|"
+                ])
+
+            except Exception as e:
+                text.append(f"Database error: {e}")
+
+        else:
+            text.append("No database produced.")
+
+        with open(summary,"a") as f:
+            f.write("\n".join(text))
+
+        PY
