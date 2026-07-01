@@ -1,0 +1,495 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bonde NSE Scanner — Forward Tester (Live Signal Tracker)
+# GitHub Actions Workflow
+#
+# WHAT THIS IS:
+#   A forward tester is NOT a backtest. It runs AFTER each daily scan,
+#   picks up every signal in the DB that hasn't closed yet, and checks
+#   current price against entry zone, stop loss, and targets.
+#   This gives you a real-time, day-by-day P&L record of every signal
+#   the scanner has ever generated — zero hindsight bias.
+#
+# SCHEDULE:
+#   Runs Mon–Fri at 4:15 PM IST (10:45 UTC) — 45 min after NSE close.
+#   This is AFTER the daily scan (3:45 PM IST) so all new signals are
+#   already in the DB before verification starts.
+#
+# WHAT IT TRACKS PER SIGNAL:
+#   • Entry triggered?  (High crossed entry_zone_high?)
+#   • Day entered       (first bar where entry was triggered)
+#   • Stop hit?         (Low dropped below stop_loss while in trade?)
+#   • Target 1 / 2 / 3 achieved?
+#   • Maximum Favourable Excursion (MFE) — how far it moved in your favour
+#   • Maximum Adverse Excursion (MAE) — how far it moved against you
+#   • Days held         (for MB: max 5 bars enforced)
+#   • Exit reason       (SL / T1 / T2 / T3 / MAX_HOLD / EXPIRED)
+#   • Final P&L in %R   (risk-normalised so different position sizes compare)
+#
+# SIGNAL LIFECYCLE:
+#   PENDING  → entry_zone_high not yet crossed
+#   ACTIVE   → entry triggered, trade is open
+#   CLOSED   → exit reason recorded (SL / target / max hold)
+#   EXPIRED  → signal date > WATCHLIST_EXPIRY_DAYS with no entry triggered
+#
+# OUTPUTS:
+#   • Updates data/signals.db in-place (signal_tracker.verify_all_signals)
+#   • Exports forward_test_report.xlsx  (open signals + closed trades summary)
+#   • Sends Telegram digest of newly closed trades
+#   • Uploads DB snapshot + Excel as 90-day artifacts
+#
+# Secrets required:
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Bonde Forward Tester
+
+on:
+  schedule:
+    #         ┌─ min  ┌─ hour (UTC)  ┌─ day  ┌─ month  ┌─ weekday (1=Mon)
+    - cron: "45 10 * * 1-5"   # 10:45 UTC = 16:15 IST, Mon–Fri
+    #                          # 45 min after NSE close; prices fully settled
+
+  workflow_dispatch:           # manual trigger for testing / catch-up
+    inputs:
+      notify_telegram:
+        description: "Send Telegram digest of newly closed trades? (yes / no)"
+        required: false
+        default: "yes"
+      export_all:
+        description: "Export ALL signals (not just today's closures) to Excel? (yes / no)"
+        required: false
+        default: "no"
+
+env:
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+  ACCOUNT_SIZE:       ${{ secrets.ACCOUNT_SIZE || '1000000' }}
+  RISK_PCT:           ${{ secrets.RISK_PCT || '1.0' }}
+
+concurrency:
+  group: bonde-scanner          # shares group with daily scan; won't overlap
+  cancel-in-progress: false
+
+jobs:
+  forward-test:
+    name: Bonde Forward Tester — Signal Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ─────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. Date metadata ─────────────────────────────────────────────────────
+      - name: Get date metadata
+        id: date
+        run: |
+          echo "today=$(date +'%Y-%m-%d')"                          >> $GITHUB_OUTPUT
+          echo "ts=$(date +'%Y%m%d_%H%M')"                          >> $GITHUB_OUTPUT
+          echo "ist=$(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M IST')" >> $GITHUB_OUTPUT
+
+      # ── 4. Restore price DB cache ────────────────────────────────────────────
+      # Must restore the same cache the daily scan populated so the signal
+      # tracker can load price data without re-downloading everything.
+      - name: Restore price data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/
+            data/signals.db
+          key: bonde-price-db-${{ runner.os }}-week-${{ steps.date.outputs.week }}
+          restore-keys: |
+            bonde-price-db-${{ runner.os }}-week-
+            bonde-price-db-${{ runner.os }}-
+
+      # ── 5. Run signal verification (forward test) ────────────────────────────
+      # signal_tracker.verify_all_signals() is already in the codebase.
+      # We call it via a tiny shim that also exports the Excel report.
+      - name: Run forward tester
+        run: |
+          python - << 'PYEOF'
+          import sys
+          from pathlib import Path
+
+          # ── call the existing signal tracker ────────────────────────────────
+          from signal_tracker import verify_all_signals
+          verify_all_signals()
+          print("Signal verification complete.")
+
+          # ── export forward test report to Excel ──────────────────────────────
+          import sqlite3
+          import pandas as pd
+          from datetime import date
+
+          db = Path("data/signals.db")
+          if not db.exists():
+              print("No data/signals.db found — skipping Excel export.")
+              sys.exit(0)
+
+          Path("reports").mkdir(exist_ok=True)
+          con = sqlite3.connect(db)
+
+          # Open signals (PENDING + ACTIVE)
+          try:
+              open_df = pd.read_sql_query(
+                  """
+                  SELECT symbol, signal_type, scan_date, entry_zone_high,
+                         stop_loss, target1, target2, target3,
+                         status, days_held, mfe_pct, mae_pct,
+                         composite_score, rs_rank
+                  FROM   signals
+                  WHERE  status IN ('PENDING', 'ACTIVE')
+                  ORDER  BY scan_date DESC, rs_rank DESC
+                  """,
+                  con,
+              )
+          except Exception:
+              open_df = pd.DataFrame()
+
+          # Closed trades (last 90 days)
+          try:
+              closed_df = pd.read_sql_query(
+                  """
+                  SELECT symbol, signal_type, scan_date,
+                         entry_zone_high, stop_loss,
+                         target1, target2, target3,
+                         status, exit_reason,
+                         entry_triggered_date, exit_date,
+                         days_held, pnl_pct, pnl_rs,
+                         mfe_pct, mae_pct,
+                         composite_score, rs_rank,
+                         t1_hit, t2_hit, t3_hit, sl_hit
+                  FROM   signals
+                  WHERE  status IN ('CLOSED', 'EXPIRED')
+                    AND  scan_date >= date('now', '-90 days')
+                  ORDER  BY exit_date DESC
+                  """,
+                  con,
+              )
+          except Exception:
+              closed_df = pd.DataFrame()
+
+          # Performance summary by signal type
+          try:
+              summary_df = pd.read_sql_query(
+                  """
+                  SELECT
+                      signal_type,
+                      COUNT(*)                                  AS total_trades,
+                      ROUND(AVG(CASE WHEN pnl_rs > 0 THEN 1.0 ELSE 0.0 END) * 100, 1)
+                                                                AS win_rate_pct,
+                      ROUND(AVG(pnl_rs), 2)                    AS avg_pnl_r,
+                      ROUND(SUM(CASE WHEN pnl_rs > 0 THEN pnl_rs ELSE 0 END) /
+                            MAX(ABS(SUM(CASE WHEN pnl_rs < 0 THEN pnl_rs ELSE 0 END)), 0.01), 2)
+                                                                AS profit_factor,
+                      ROUND(AVG(days_held), 1)                 AS avg_hold_days,
+                      ROUND(AVG(mfe_pct), 2)                   AS avg_mfe_pct,
+                      ROUND(AVG(mae_pct), 2)                   AS avg_mae_pct
+                  FROM   signals
+                  WHERE  status = 'CLOSED'
+                    AND  scan_date >= date('now', '-365 days')
+                  GROUP  BY signal_type
+                  ORDER  BY signal_type
+                  """,
+                  con,
+              )
+          except Exception:
+              summary_df = pd.DataFrame()
+
+          # Score-band breakdown  (does higher score → better win rate?)
+          try:
+              score_df = pd.read_sql_query(
+                  """
+                  SELECT
+                      CASE
+                          WHEN composite_score >= 80 THEN 'A  (80-100)'
+                          WHEN composite_score >= 60 THEN 'B  (60-79)'
+                          WHEN composite_score >= 40 THEN 'C  (40-59)'
+                          ELSE                            'D  (<40)'
+                      END                                         AS score_band,
+                      COUNT(*)                                    AS trades,
+                      ROUND(AVG(CASE WHEN pnl_rs > 0 THEN 1.0 ELSE 0.0 END)*100, 1)
+                                                                  AS win_rate_pct,
+                      ROUND(AVG(pnl_rs), 2)                      AS avg_pnl_r,
+                      ROUND(AVG(days_held), 1)                    AS avg_hold_days
+                  FROM   signals
+                  WHERE  status = 'CLOSED'
+                    AND  scan_date >= date('now', '-365 days')
+                  GROUP  BY score_band
+                  ORDER  BY score_band
+                  """,
+                  con,
+              )
+          except Exception:
+              score_df = pd.DataFrame()
+
+          # Monthly P&L  (regime dependency check)
+          try:
+              monthly_df = pd.read_sql_query(
+                  """
+                  SELECT
+                      strftime('%Y-%m', exit_date)               AS month,
+                      COUNT(*)                                    AS trades,
+                      ROUND(AVG(CASE WHEN pnl_rs > 0 THEN 1.0 ELSE 0.0 END)*100, 1)
+                                                                  AS win_rate_pct,
+                      ROUND(SUM(pnl_rs), 2)                      AS total_r,
+                      ROUND(AVG(pnl_rs), 2)                      AS avg_r_per_trade
+                  FROM   signals
+                  WHERE  status = 'CLOSED'
+                    AND  exit_date IS NOT NULL
+                  GROUP  BY month
+                  ORDER  BY month DESC
+                  LIMIT  24
+                  """,
+                  con,
+              )
+          except Exception:
+              monthly_df = pd.DataFrame()
+
+          con.close()
+
+          # Write Excel with multiple sheets
+          out = Path(f"reports/forward_test_report_{date.today()}.xlsx")
+          with pd.ExcelWriter(out, engine="openpyxl") as writer:
+              if not open_df.empty:
+                  open_df.to_excel(writer, sheet_name="Open Signals", index=False)
+              if not closed_df.empty:
+                  closed_df.to_excel(writer, sheet_name="Closed Trades (90d)", index=False)
+              if not summary_df.empty:
+                  summary_df.to_excel(writer, sheet_name="By Signal Type", index=False)
+              if not score_df.empty:
+                  score_df.to_excel(writer, sheet_name="By Score Band", index=False)
+              if not monthly_df.empty:
+                  monthly_df.to_excel(writer, sheet_name="Monthly P&L", index=False)
+
+          print(f"Excel report written → {out}")
+          print(f"  Open signals  : {len(open_df)}")
+          print(f"  Closed trades : {len(closed_df)}")
+          PYEOF
+
+      # ── 6. Telegram digest of newly closed trades ────────────────────────────
+      - name: Send Telegram digest
+        if: >
+          github.event.inputs.notify_telegram != 'no' &&
+          env.TELEGRAM_BOT_TOKEN != '' &&
+          env.TELEGRAM_CHAT_ID != ''
+        run: |
+          python - << 'PYEOF'
+          import os, sqlite3, json, urllib.request
+          from pathlib import Path
+
+          token   = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+          db      = Path("data/signals.db")
+
+          if not db.exists():
+              print("No DB — skipping Telegram")
+              exit(0)
+
+          con = sqlite3.connect(db)
+
+          # Signals closed TODAY
+          try:
+              rows = con.execute(
+                  """
+                  SELECT symbol, signal_type, exit_reason,
+                         pnl_pct, pnl_rs, days_held,
+                         t1_hit, t2_hit, t3_hit
+                  FROM   signals
+                  WHERE  status = 'CLOSED'
+                    AND  exit_date = date('now')
+                  ORDER  BY pnl_rs DESC
+                  """
+              ).fetchall()
+          except Exception:
+              rows = []
+
+          # Summary stats for open signals
+          try:
+              open_count = con.execute(
+                  "SELECT COUNT(*) FROM signals WHERE status IN ('PENDING','ACTIVE')"
+              ).fetchone()[0]
+              active_count = con.execute(
+                  "SELECT COUNT(*) FROM signals WHERE status = 'ACTIVE'"
+              ).fetchone()[0]
+          except Exception:
+              open_count = active_count = "?"
+
+          con.close()
+
+          lines = ["📋 *Bonde Forward Tester — Daily Update*", ""]
+
+          if rows:
+              winners = [r for r in rows if r[3] and r[3] > 0]
+              losers  = [r for r in rows if r[3] and r[3] <= 0]
+              lines.append(f"*Closed today: {len(rows)} trades*")
+              lines.append(f"  ✅ Winners: {len(winners)}   ❌ Losers: {len(losers)}")
+              lines.append("")
+              for sym, stype, reason, pnl_pct, pnl_r, days, t1, t2, t3 in rows[:10]:
+                  icon  = "✅" if pnl_r and pnl_r > 0 else "❌"
+                  tgts  = []
+                  if t1: tgts.append("T1")
+                  if t2: tgts.append("T2")
+                  if t3: tgts.append("T3")
+                  tgt_s = "/".join(tgts) if tgts else reason
+                  lines.append(
+                      f"{icon} `{sym}` [{stype}] {pnl_r:+.2f}R "
+                      f"({pnl_pct:+.1f}%) | {days}d | {tgt_s}"
+                  )
+              if len(rows) > 10:
+                  lines.append(f"  … and {len(rows)-10} more")
+          else:
+              lines.append("No trades closed today.")
+
+          lines += [
+              "",
+              f"📊 Open: {open_count} signals ({active_count} active)",
+              "",
+              "Full report in GitHub Actions artifacts.",
+          ]
+
+          msg  = "\n".join(lines)
+          data = json.dumps({
+              "chat_id":    chat_id,
+              "text":       msg,
+              "parse_mode": "Markdown",
+          }).encode()
+          req  = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data=data,
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(req) as resp:
+              print("Telegram OK:", resp.status)
+          PYEOF
+        continue-on-error: true   # never fail the whole job over a notification
+
+      # ── 7. Upload forward test Excel report ───────────────────────────────────
+      - name: Upload forward test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonde-forward-test-${{ steps.date.outputs.ts }}
+          path: reports/forward_test_report_*.xlsx
+          retention-days: 90
+          if-no-files-found: warn
+
+      # ── 8. Upload DB snapshot ─────────────────────────────────────────────────
+      - name: Upload signals DB snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonde-fwd-db-${{ steps.date.outputs.ts }}
+          path: data/signals.db
+          retention-days: 90
+          if-no-files-found: warn
+
+      # ── 9. Upload logs ────────────────────────────────────────────────────────
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonde-fwd-logs-${{ steps.date.outputs.ts }}
+          path: logs/
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── 10. Job summary ───────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          python - << 'PYEOF'
+          import sqlite3, os
+          from pathlib import Path
+
+          db  = Path("data/signals.db")
+          out = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          ist = os.environ.get("IST_TIME", "")
+
+          lines = [f"## Bonde Forward Tester — {ist}", ""]
+
+          if db.exists():
+              try:
+                  con = sqlite3.connect(db)
+
+                  # Overall live stats
+                  pending = con.execute(
+                      "SELECT COUNT(*) FROM signals WHERE status='PENDING'"
+                  ).fetchone()[0]
+                  active = con.execute(
+                      "SELECT COUNT(*) FROM signals WHERE status='ACTIVE'"
+                  ).fetchone()[0]
+                  closed_total = con.execute(
+                      "SELECT COUNT(*) FROM signals WHERE status='CLOSED'"
+                  ).fetchone()[0]
+
+                  # Win rate + avg R (all-time)
+                  perf = con.execute(
+                      """
+                      SELECT
+                          ROUND(AVG(CASE WHEN pnl_rs > 0 THEN 1.0 ELSE 0.0 END)*100, 1),
+                          ROUND(AVG(pnl_rs), 2),
+                          ROUND(SUM(CASE WHEN pnl_rs > 0 THEN pnl_rs ELSE 0 END) /
+                                MAX(ABS(SUM(CASE WHEN pnl_rs < 0 THEN pnl_rs ELSE 0 END)),0.01), 2)
+                      FROM signals WHERE status='CLOSED'
+                      """
+                  ).fetchone()
+                  win_rate, avg_r, pf = perf if perf else ("?", "?", "?")
+
+                  # Closed today
+                  today_closed = con.execute(
+                      "SELECT COUNT(*) FROM signals WHERE status='CLOSED' AND exit_date=date('now')"
+                  ).fetchone()[0]
+                  con.close()
+
+                  lines += [
+                      "### Live Signal Status",
+                      "",
+                      "| Status | Count |",
+                      "|--------|-------|",
+                      f"| 🟡 Pending (entry not yet triggered) | {pending} |",
+                      f"| 🟢 Active (in trade) | {active} |",
+                      f"| ⚪ Closed today | {today_closed} |",
+                      f"| Total closed (all-time) | {closed_total} |",
+                      "",
+                      "### Forward Test Performance (All-Time Closed Trades)",
+                      "",
+                      "| Metric | Value |",
+                      "|--------|-------|",
+                      f"| Win rate | **{win_rate}%** |",
+                      f"| Avg P&L per trade | **{avg_r}R** |",
+                      f"| Profit factor | **{pf}** |",
+                  ]
+              except Exception as e:
+                  lines.append(f"⚠️ Could not query DB: {e}")
+          else:
+              lines.append("⚠️ data/signals.db not found.")
+
+          lines += [
+              "",
+              "Download **bonde-forward-test** artifact for the full Excel breakdown:",
+              "- Sheet: *Open Signals* — all PENDING / ACTIVE signals",
+              "- Sheet: *Closed Trades (90d)* — every closed trade with MFE/MAE",
+              "- Sheet: *By Signal Type* — MB vs EP win rate comparison",
+              "- Sheet: *By Score Band* — does higher composite score predict outcome?",
+              "- Sheet: *Monthly P&L* — regime dependency (any month negative?)",
+          ]
+
+          with open(out, "a") as f:
+              f.write("\n".join(lines) + "\n")
+          PYEOF
+        env:
+          IST_TIME: ${{ steps.date.outputs.ist }}
